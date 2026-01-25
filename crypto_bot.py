@@ -1,6 +1,6 @@
 import os
+TOKEN = os.getenv("BOT_TOKEN")
 
-TOKEN = os.getenv("BOT_TOKEN", "ВАШ_TELEGRAM_TOKEN")
 import asyncio
 from io import BytesIO
 
