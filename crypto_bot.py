@@ -29,7 +29,7 @@ from telegram.ext import (
 )
 
 # ================== НАСТРОЙКИ ==================
-TOKEN = "ВАШ_TELEGRAM_TOKEN"  # <-- вставь реальный токен
+#TOKEN = "ВАШ_TELEGRAM_TOKEN"  # <-- вставь реальный токен
 TOP_COINS = ["BTC", "ETH", "BNB", "SOL", "ADA", "XRP"]
 MOSCOW_TZ = pytz.timezone("Europe/Moscow")
 CHECK_ALERTS_EVERY_SECONDS = 30
