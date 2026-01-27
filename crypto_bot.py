@@ -62,29 +62,69 @@ def placeholder_image(name="ui.jpg") -> BytesIO:
     buf.seek(0)
     return buf
 
-# ================== BINANCE ==================
+# ================= BINANCE =================
+import time
+import logging
+
+BINANCE_BASES = [
+    "https://api.binance.com",          # основной
+    "https://data-api.binance.vision",  # зеркало (часто спасает на хостингах)
+]
+
+SESSION = requests.Session()
+SESSION.headers.update({
+    "User-Agent": "Mozilla/5.0 (cryptobot; +https://t.me/your_bot)"
+})
+
+def _get_json(path: str, params: dict | None = None, timeout: int = 10):
+    last_err = None
+    for base in BINANCE_BASES:
+        url = base + path
+        try:
+            r = SESSION.get(url, params=params, timeout=timeout)
+            if r.status_code != 200:
+                last_err = f"{r.status_code} {r.text[:120]}"
+                continue
+            data = r.json()
+            if isinstance(data, dict) and "code" in data and "msg" in data:
+                last_err = f'Binance error {data.get("code")}: {data.get("msg")}'
+                continue
+            return data
+        except Exception as e:
+            last_err = repr(e)
+            continue
+
+    logging.warning("Binance request failed for %s params=%s | last_err=%s", path, params, last_err)
+    return None
+
 def get_price(symbol: str):
+    data = _get_json("/api/v3/ticker/price", {"symbol": f"{symbol}USDT"})
+    if not data or "price" not in data:
+        return None
     try:
-        url = f"{BINANCE_BASE}/api/v3/ticker/price"
-        data = requests.get(url, params={"symbol": f"{symbol}USDT"}, timeout=8).json()
         return float(data["price"])
     except:
         return None
 
 def get_24h_change(symbol: str):
+    data = _get_json("/api/v3/ticker/24hr", {"symbol": f"{symbol}USDT"})
+    if not data or "priceChangePercent" not in data:
+        return None
     try:
-        url = f"{BINANCE_BASE}/api/v3/ticker/24hr"
-        data = requests.get(url, params={"symbol": f"{symbol}USDT"}, timeout=8).json()
         return float(data["priceChangePercent"])
     except:
         return None
 
 def get_candles(symbol: str, interval: str, limit: int):
-    try:
-        url = f"{BINANCE_BASE}/api/v3/klines"
-        params = {"symbol": f"{symbol}USDT", "interval": interval, "limit": limit}
-        data = requests.get(url, params=params, timeout=8).json()
+    data = _get_json("/api/v3/klines", {
+        "symbol": f"{symbol}USDT",
+        "interval": interval,
+        "limit": limit
+    })
+    if not data or not isinstance(data, list):
+        return None
 
+    try:
         df = pd.DataFrame(data, columns=[
             "time","open","high","low","close","volume",
             "_","_","_","_","_","_"
@@ -95,11 +135,11 @@ def get_candles(symbol: str, interval: str, limit: int):
               .dt.tz_convert(MOSCOW_TZ)
         )
         df.set_index("time", inplace=True)
-        df = df[["open", "high", "low", "close", "volume"]].astype(float)
+        df = df[["open","high","low","close"]].astype(float)
         return df
-    except:
+    except Exception as e:
+        logging.warning("Candles parse failed: %r", e)
         return None
-
 # ================= RSI =================
 def calculate_rsi(df: pd.DataFrame, period: int = 14):
     delta = df["close"].diff()
