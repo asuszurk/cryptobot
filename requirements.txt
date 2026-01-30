@@ -1,7 +1,8 @@
-python-telegram-bot==20.8
-requests
-pandas
-pytz
-mplfinance
-matplotlib
+python-telegram-bot==20.7
+requests==2.32.3
+pandas==2.2.2
+pytz==2024.1
+mplfinance==0.12.10b0
+matplotlib==3.9.0
+
 
