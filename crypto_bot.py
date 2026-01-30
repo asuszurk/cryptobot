@@ -1,3 +1,10 @@
+# crypto_bot.py
+# Telegram Crypto Bot (Binance) — отвечает на КАЖДОЕ сообщение новым сообщением,
+# строит свечной график + RSI, умеет уведомления, и работает с ЛЮБЫМИ монетами,
+# у которых есть пара SYMBOLUSDT на Binance.
+#
+# ENV (Render): BOT_TOKEN = токен бота из @BotFather
+
 import os
 import json
 import time
@@ -15,11 +22,7 @@ matplotlib.use("Agg")  # важно для Render/серверов без экр
 
 import mplfinance as mpf
 
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -31,18 +34,22 @@ from telegram.ext import (
 
 # ===================== НАСТРОЙКИ =====================
 
-TOKEN = os.getenv("BOT_TOKEN", "").strip()  # на Render добавь ENV: BOT_TOKEN
+TOKEN = os.getenv("BOT_TOKEN", "").strip()
 MOSCOW_TZ = pytz.timezone("Europe/Moscow")
 
+# Кнопки для быстрого выбора (но бот принимает любые тикеры)
 TOP_COINS = ["BTC", "ETH", "BNB", "SOL", "ADA", "XRP"]
 
 BINANCE_BASE = "https://api.binance.com"
 ALERTS_FILE = "alerts.json"
 
-CHECK_ALERTS_EVERY_SECONDS = 20  # как часто проверять уведомления
+CHECK_ALERTS_EVERY_SECONDS = 20
+HTTP_TIMEOUT = 12
 
-# Чтобы бот не зависал из-за сети
-HTTP_TIMEOUT = 8
+# КЕШ всех торговых пар Binance
+BINANCE_SYMBOLS_CACHE: set[str] = set()
+BINANCE_SYMBOLS_LAST_UPDATE = 0
+BINANCE_SYMBOLS_TTL = 6 * 60 * 60  # 6 часов
 
 # ===================== УВЕДОМЛЕНИЯ (МОДЕЛЬ) =====================
 
@@ -57,19 +64,18 @@ class PriceAlert:
     is_active: bool = True
 
 
-# Хранилище в памяти: user_id -> list[PriceAlert]
 ALERTS: Dict[int, List[PriceAlert]] = {}
 NEXT_ALERT_ID = 1
 
 
 def load_alerts() -> None:
-    """Загружаем уведомления из файла (если есть)."""
     global ALERTS, NEXT_ALERT_ID
     try:
         if not os.path.exists(ALERTS_FILE):
             return
         with open(ALERTS_FILE, "r", encoding="utf-8") as f:
             raw = json.load(f)
+
         ALERTS = {}
         max_id = 0
         for user_id_str, items in raw.get("alerts", {}).items():
@@ -79,15 +85,14 @@ def load_alerts() -> None:
                 a = PriceAlert(**it)
                 ALERTS[uid].append(a)
                 max_id = max(max_id, a.alert_id)
+
         NEXT_ALERT_ID = max_id + 1
     except Exception:
-        # если файл битый — просто стартуем пусто
         ALERTS = {}
         NEXT_ALERT_ID = 1
 
 
 def save_alerts() -> None:
-    """Сохраняем уведомления в файл."""
     try:
         raw = {"alerts": {}}
         for uid, items in ALERTS.items():
@@ -107,7 +112,7 @@ def add_alert(user_id: int, symbol: str, direction: str, target: float) -> Price
     a = PriceAlert(
         alert_id=NEXT_ALERT_ID,
         user_id=user_id,
-        symbol=symbol,
+        symbol=symbol.upper(),
         direction=direction,
         target=target,
         created_at=int(time.time()),
@@ -131,7 +136,7 @@ def delete_alert(user_id: int, alert_id: int) -> bool:
 
 # ===================== BINANCE API =====================
 
-def _binance_get(path: str, params: Optional[dict] = None) -> Optional[dict]:
+def _binance_get(path: str, params: Optional[dict] = None):
     try:
         url = f"{BINANCE_BASE}{path}"
         r = requests.get(url, params=params, timeout=HTTP_TIMEOUT)
@@ -144,9 +149,45 @@ def _binance_get(path: str, params: Optional[dict] = None) -> Optional[dict]:
         return None
 
 
+def refresh_binance_symbols(force: bool = False) -> None:
+    """Качаем все торговые пары Binance и кешируем."""
+    global BINANCE_SYMBOLS_CACHE, BINANCE_SYMBOLS_LAST_UPDATE
+
+    now = int(time.time())
+    if not force and BINANCE_SYMBOLS_CACHE and (now - BINANCE_SYMBOLS_LAST_UPDATE) < BINANCE_SYMBOLS_TTL:
+        return
+
+    data = _binance_get("/api/v3/exchangeInfo", params=None)
+    if not isinstance(data, dict) or "symbols" not in data:
+        return
+
+    symbols = set()
+    try:
+        for s in data["symbols"]:
+            if s.get("status") == "TRADING" and s.get("isSpotTradingAllowed", True):
+                sym = s.get("symbol")
+                if sym:
+                    symbols.add(sym)
+    except Exception:
+        return
+
+    if symbols:
+        BINANCE_SYMBOLS_CACHE = symbols
+        BINANCE_SYMBOLS_LAST_UPDATE = now
+
+
+def binance_pair_exists(base: str, quote: str = "USDT") -> bool:
+    refresh_binance_symbols()
+    return f"{base.upper()}{quote.upper()}" in BINANCE_SYMBOLS_CACHE
+
+
 def get_price(symbol: str) -> Optional[float]:
-    data = _binance_get("/api/v3/ticker/price", params={"symbol": f"{symbol}USDT"})
-    if not data or "price" not in data:
+    sym = symbol.upper().strip()
+    if not binance_pair_exists(sym, "USDT"):
+        return None
+
+    data = _binance_get("/api/v3/ticker/price", params={"symbol": f"{sym}USDT"})
+    if not isinstance(data, dict) or "price" not in data:
         return None
     try:
         return float(data["price"])
@@ -155,8 +196,12 @@ def get_price(symbol: str) -> Optional[float]:
 
 
 def get_24h_change(symbol: str) -> Optional[float]:
-    data = _binance_get("/api/v3/ticker/24hr", params={"symbol": f"{symbol}USDT"})
-    if not data or "priceChangePercent" not in data:
+    sym = symbol.upper().strip()
+    if not binance_pair_exists(sym, "USDT"):
+        return None
+
+    data = _binance_get("/api/v3/ticker/24hr", params={"symbol": f"{sym}USDT"})
+    if not isinstance(data, dict) or "priceChangePercent" not in data:
         return None
     try:
         return float(data["priceChangePercent"])
@@ -165,15 +210,35 @@ def get_24h_change(symbol: str) -> Optional[float]:
 
 
 def get_candles(symbol: str, interval: str, limit: int) -> Optional[pd.DataFrame]:
-    data = _binance_get("/api/v3/klines", params={"symbol": f"{symbol}USDT", "interval": interval, "limit": limit})
+    sym = symbol.upper().strip()
+    if not binance_pair_exists(sym, "USDT"):
+        return None
+
+    data = _binance_get(
+        "/api/v3/klines",
+        params={"symbol": f"{sym}USDT", "interval": interval, "limit": limit},
+    )
     if not data or not isinstance(data, list):
         return None
 
     try:
-        df = pd.DataFrame(data, columns=[
-            "time", "open", "high", "low", "close", "volume",
-            "c1", "c2", "c3", "c4", "c5", "c6"
-        ])
+        df = pd.DataFrame(
+            data,
+            columns=[
+                "time",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "c1",
+                "c2",
+                "c3",
+                "c4",
+                "c5",
+                "c6",
+            ],
+        )
         df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True).dt.tz_convert(MOSCOW_TZ)
         df.set_index("time", inplace=True)
         df = df[["open", "high", "low", "close"]].astype(float)
@@ -206,8 +271,8 @@ def rsi_text(rsi_value: float) -> str:
 
 
 def detect_trend(df: pd.DataFrame) -> Tuple[str, float]:
-    first = df["close"].iloc[0]
-    last = df["close"].iloc[-1]
+    first = float(df["close"].iloc[0])
+    last = float(df["close"].iloc[-1])
     change = ((last - first) / first) * 100
 
     if change > 1:
@@ -221,33 +286,28 @@ def detect_trend(df: pd.DataFrame) -> Tuple[str, float]:
 
 def build_chart_with_rsi(df: pd.DataFrame, symbol: str, tf: str) -> Tuple[BytesIO, float]:
     df = df.copy()
-    df["RSI"] = calculate_rsi(df).fillna(method="bfill")
+    df["RSI"] = calculate_rsi(df).bfill()
 
-    rsi_plot = mpf.make_addplot(
-        df["RSI"],
-        panel=1,
-        ylabel="RSI",
-    )
+    rsi_plot = mpf.make_addplot(df["RSI"], panel=1, ylabel="RSI")
 
     buf = BytesIO()
 
-    # ВАЖНО: используем linestyle (не linestyles)
     mpf.plot(
         df,
         type="candle",
         style="charles",
         title=f"{symbol} — {tf} (МСК)",
-        ylabel="USD",
+        ylabel="USDT",
         addplot=[rsi_plot],
         panel_ratios=(3, 1),
         hlines=dict(
             hlines=[30, 70],
             colors=["green", "red"],
             linestyle="--",
-            panel=1
+            panel=1,
         ),
         volume=False,
-        savefig=dict(fname=buf, dpi=120, bbox_inches="tight")
+        savefig=dict(fname=buf, dpi=120, bbox_inches="tight"),
     )
 
     buf.seek(0)
@@ -263,38 +323,43 @@ def kb_main_menu() -> InlineKeyboardMarkup:
 
 
 def kb_timeframes() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
+    return InlineKeyboardMarkup(
         [
-            InlineKeyboardButton("🕐 1h", callback_data="TF_1h"),
-            InlineKeyboardButton("🕓 4h", callback_data="TF_4h"),
-            InlineKeyboardButton("📅 1d", callback_data="TF_1d"),
-        ],
-        [
-            InlineKeyboardButton("🔔 Установить уведомление", callback_data="SET_ALERT"),
-            InlineKeyboardButton("📌 Мои уведомления", callback_data="MY_ALERTS"),
-        ],
-        [InlineKeyboardButton("🏠 Главное меню", callback_data="MENU")]
-    ])
+            [
+                InlineKeyboardButton("🕐 1h", callback_data="TF_1h"),
+                InlineKeyboardButton("🕓 4h", callback_data="TF_4h"),
+                InlineKeyboardButton("📅 1d", callback_data="TF_1d"),
+            ],
+            [
+                InlineKeyboardButton("🔔 Установить уведомление", callback_data="SET_ALERT"),
+                InlineKeyboardButton("📌 Мои уведомления", callback_data="MY_ALERTS"),
+            ],
+            [InlineKeyboardButton("🏠 Главное меню", callback_data="MENU")],
+        ]
+    )
 
 
 def kb_after_chart() -> InlineKeyboardMarkup:
-    # по твоему требованию: под графиком НЕ надо "назад", только логичные действия
-    return InlineKeyboardMarkup([
+    return InlineKeyboardMarkup(
         [
-            InlineKeyboardButton("🔔 Установить уведомление", callback_data="SET_ALERT"),
-            InlineKeyboardButton("📌 Мои уведомления", callback_data="MY_ALERTS"),
-        ],
-        [InlineKeyboardButton("🏠 Главное меню", callback_data="MENU")]
-    ])
+            [
+                InlineKeyboardButton("🔔 Установить уведомление", callback_data="SET_ALERT"),
+                InlineKeyboardButton("📌 Мои уведомления", callback_data="MY_ALERTS"),
+            ],
+            [InlineKeyboardButton("🏠 Главное меню", callback_data="MENU")],
+        ]
+    )
 
 
 def kb_after_alert_created() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
+    return InlineKeyboardMarkup(
         [
-            InlineKeyboardButton("📌 Мои уведомления", callback_data="MY_ALERTS"),
-            InlineKeyboardButton("🏠 Главное меню", callback_data="MENU"),
+            [
+                InlineKeyboardButton("📌 Мои уведомления", callback_data="MY_ALERTS"),
+                InlineKeyboardButton("🏠 Главное меню", callback_data="MENU"),
+            ]
         ]
-    ])
+    )
 
 
 def kb_alerts_list(user_id: int) -> InlineKeyboardMarkup:
@@ -302,7 +367,14 @@ def kb_alerts_list(user_id: int) -> InlineKeyboardMarkup:
     alerts = get_user_alerts(user_id)
     for a in alerts:
         arrow = "≥" if a.direction == "above" else "≤"
-        rows.append([InlineKeyboardButton(f"❌ #{a.alert_id} {a.symbol} {arrow} {a.target}", callback_data=f"DEL_{a.alert_id}")])
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"❌ #{a.alert_id} {a.symbol} {arrow} {a.target}",
+                    callback_data=f"DEL_{a.alert_id}",
+                )
+            ]
+        )
     rows.append([InlineKeyboardButton("🏠 Главное меню", callback_data="MENU")])
     return InlineKeyboardMarkup(rows)
 
@@ -310,15 +382,18 @@ def kb_alerts_list(user_id: int) -> InlineKeyboardMarkup:
 # ===================== ВСПОМОГАТЕЛЬНОЕ =====================
 
 def normalize_symbol(text: str) -> str:
+    # Принимаем любые формы: "btc", "BTCUSDT", "BTC/USDT"
     s = (text or "").strip().upper()
-    s = s.replace("/", "").replace("-", "").replace("USDT", "").strip()
+    s = s.replace("/", "").replace("-", "").replace(" ", "")
+    # Если человек ввёл BTCUSDT — оставим BTC
+    if s.endswith("USDT") and len(s) > 4:
+        s = s[:-4]
     return s
 
 
 def parse_alert_price(text: str) -> Optional[Tuple[str, float]]:
     """
-    Возвращает (direction, price) или None.
-    Поддержка ввода:
+    Поддержка:
       50000  -> above
       >50000 -> above
       <50000 -> below
@@ -345,13 +420,30 @@ def parse_alert_price(text: str) -> Optional[Tuple[str, float]]:
 
 
 def binance_symbol_hint(symbol: str) -> str:
+    s = symbol.upper().strip()
+
+    # Если USDT-пары нет, подскажем другие котировки
+    quotes_to_try = ["USDC", "FDUSD", "BUSD", "TRY", "BTC", "ETH"]
+    available = []
+    for q in quotes_to_try:
+        if binance_pair_exists(s, q):
+            available.append(f"{s}{q}")
+
+    if available:
+        pairs = ", ".join(available[:6])
+        return (
+            f"❌ На Binance **нет пары {s}USDT**.\n\n"
+            f"✅ Зато есть: {pairs}\n\n"
+            f"👉 Сейчас бот строит графики по USDT-парам.\n"
+            f"Выбери другую монету или напиши тикер, у которого есть USDT-пара."
+        )
+
     return (
-        f"❌ Не удалось получить данные по `{symbol}`.\n\n"
+        f"❌ Не удалось получить данные по `{s}`.\n\n"
         f"Причины:\n"
-        f"• такой пары `{symbol}USDT` нет на Binance\n"
+        f"• пары `{s}USDT` нет на Binance\n"
         f"• временно недоступен Binance API\n\n"
-        f"✅ Попробуй популярные: BTC, ETH, SOL, BNB, XRP\n"
-        f"Или выбери кнопку ниже."
+        f"✅ Напиши любой тикер (например: BTC, ETH, SOL) или выбери кнопку ниже."
     )
 
 
@@ -360,37 +452,39 @@ def binance_symbol_hint(symbol: str) -> str:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["awaiting_alert_price"] = False
     context.user_data.pop("symbol", None)
+    context.user_data.pop("alert_symbol", None)
 
     await update.message.reply_text(
         "Выберите криптовалюту или введите символ (например BTC):",
-        reply_markup=kb_main_menu()
+        reply_markup=kb_main_menu(),
     )
 
 
 async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     data = query.data
     user_id = query.from_user.id
 
-    # Главное меню
     if data == "MENU":
         context.user_data["awaiting_alert_price"] = False
         context.user_data.pop("symbol", None)
+        context.user_data.pop("alert_symbol", None)
         await query.message.reply_text(
             "Главное меню. Выберите монету или введите символ:",
-            reply_markup=kb_main_menu()
+            reply_markup=kb_main_menu(),
         )
         return
 
-    # Мои уведомления
     if data == "MY_ALERTS":
         alerts = get_user_alerts(user_id)
         if not alerts:
             await query.message.reply_text(
-                "📌 У вас пока нет уведомлений.\n\nНажмите «Установить уведомление» после выбора монеты.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Главное меню", callback_data="MENU")]])
+                "📌 У вас пока нет уведомлений.\n\n"
+                "Выберите монету → «Установить уведомление».",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("🏠 Главное меню", callback_data="MENU")]]
+                ),
             )
             return
 
@@ -401,12 +495,16 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("\n".join(lines), reply_markup=kb_alerts_list(user_id))
         return
 
-    # Удалить уведомление
     if data.startswith("DEL_"):
         try:
             alert_id = int(data.replace("DEL_", ""))
         except ValueError:
-            await query.message.reply_text("❌ Ошибка: неверный ID уведомления.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Главное меню", callback_data="MENU")]]))
+            await query.message.reply_text(
+                "❌ Ошибка: неверный ID уведомления.",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("🏠 Главное меню", callback_data="MENU")]]
+                ),
+            )
             return
 
         ok = delete_alert(user_id, alert_id)
@@ -416,7 +514,6 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text(f"❌ Не нашёл уведомление #{alert_id}.", reply_markup=kb_alerts_list(user_id))
         return
 
-    # Выбор монеты
     if data.startswith("COIN_"):
         symbol = data.replace("COIN_", "").strip().upper()
         context.user_data["symbol"] = symbol
@@ -424,18 +521,19 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await query.message.reply_text(
             f"✅ Выбран {symbol}. Выберите таймфрейм:",
-            reply_markup=kb_timeframes()
+            reply_markup=kb_timeframes(),
         )
         return
 
-    # Установить уведомление
     if data == "SET_ALERT":
         symbol = context.user_data.get("symbol")
         if not symbol:
-            await query.message.reply_text(
-                "Сначала выберите монету в меню 🙂",
-                reply_markup=kb_main_menu()
-            )
+            await query.message.reply_text("Сначала выберите монету 🙂", reply_markup=kb_main_menu())
+            return
+
+        # проверим, что у монеты есть USDT-пара
+        if not binance_pair_exists(symbol, "USDT"):
+            await query.message.reply_text(binance_symbol_hint(symbol), reply_markup=kb_main_menu())
             return
 
         context.user_data["awaiting_alert_price"] = True
@@ -447,19 +545,15 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• 50000  (уведомить когда цена станет ≥ 50000)\n"
             "• <50000 (уведомить когда цена станет ≤ 50000)\n\n"
             f"Монета: {symbol}",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Главное меню", callback_data="MENU")]])
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Главное меню", callback_data="MENU")]]),
         )
         return
 
-    # Таймфрейм
     if data.startswith("TF_"):
         tf = data.replace("TF_", "")
         symbol = context.user_data.get("symbol")
         if not symbol:
-            await query.message.reply_text(
-                "Сначала выберите монету 🙂",
-                reply_markup=kb_main_menu()
-            )
+            await query.message.reply_text("Сначала выберите монету 🙂", reply_markup=kb_main_menu())
             return
 
         await send_crypto_info(query.message, symbol, tf)
@@ -468,43 +562,36 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    ВАЖНО: бот отвечает на ЛЮБОЕ сообщение.
+    Бот отвечает на ЛЮБОЕ сообщение.
     - если ждём цену для уведомления -> обработка цены
-    - иначе -> считаем, что это символ монеты
+    - иначе -> считаем, что это тикер монеты
     """
     text = (update.message.text or "").strip()
     user_id = update.effective_user.id
 
-    # 1) режим ожидания цены
+    # 1) ждём цену для уведомления
     if context.user_data.get("awaiting_alert_price"):
         parsed = parse_alert_price(text)
         symbol = context.user_data.get("alert_symbol") or context.user_data.get("symbol")
 
         if not symbol:
             context.user_data["awaiting_alert_price"] = False
-            await update.message.reply_text(
-                "⚠️ Я потерял выбранную монету. Выберите заново:",
-                reply_markup=kb_main_menu()
-            )
+            await update.message.reply_text("⚠️ Потерял выбранную монету. Выберите заново:", reply_markup=kb_main_menu())
             return
 
         if not parsed:
             await update.message.reply_text(
                 "⚠️ Не понял цену.\nПример: 50000 или <50000",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Главное меню", callback_data="MENU")]])
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Главное меню", callback_data="MENU")]]),
             )
             return
 
         direction, target = parsed
 
-        # проверим, что монета реально существует на Binance
         cur = get_price(symbol)
         if cur is None:
             context.user_data["awaiting_alert_price"] = False
-            await update.message.reply_text(
-                binance_symbol_hint(symbol),
-                reply_markup=kb_main_menu()
-            )
+            await update.message.reply_text(binance_symbol_hint(symbol), reply_markup=kb_main_menu())
             return
 
         a = add_alert(user_id, symbol, direction, target)
@@ -516,30 +603,32 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"ID: #{a.alert_id}\n"
             f"Монета: {a.symbol}\n"
             f"Цель: {arrow} {a.target}\n"
-            f"Текущая: {cur:.2f}",
-            reply_markup=kb_after_alert_created()
+            f"Текущая: {cur:.6f}",
+            reply_markup=kb_after_alert_created(),
         )
         return
 
-    # 2) обычный режим: считаем, что это тикер монеты
+    # 2) обычный режим: тикер
     symbol = normalize_symbol(text)
 
-    # Если человек написал ерунду — всё равно отвечаем
-    if not (2 <= len(symbol) <= 12) or not symbol.isalnum():
+    # Валидация
+    if not (2 <= len(symbol) <= 15) or not symbol.isalnum():
         await update.message.reply_text(
-            "⚠️ Я отвечаю на любые сообщения, но это не похоже на тикер монеты.\n"
-            "Напиши, например: BTC, ETH, SOL\n"
+            "⚠️ Это не похоже на тикер.\n"
+            "Напиши, например: BTC, ETH, SOL, DOGE, PEPE\n"
             "или выбери кнопку ниже 👇",
-            reply_markup=kb_main_menu()
+            reply_markup=kb_main_menu(),
         )
         return
 
-    # запомним и покажем таймфреймы
     context.user_data["symbol"] = symbol
-    await update.message.reply_text(
-        f"✅ Выбран {symbol}. Выберите таймфрейм:",
-        reply_markup=kb_timeframes()
-    )
+
+    # Если монеты на Binance в USDT нет — сразу подскажем (и всё равно ответим)
+    if not binance_pair_exists(symbol, "USDT"):
+        await update.message.reply_text(binance_symbol_hint(symbol), reply_markup=kb_main_menu())
+        return
+
+    await update.message.reply_text(f"✅ Выбран {symbol}. Выберите таймфрейм:", reply_markup=kb_timeframes())
 
 
 # ===================== ОСНОВНОЕ: ОТПРАВКА ДАННЫХ + ГРАФИК =====================
@@ -547,68 +636,70 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def send_crypto_info(message, symbol: str, tf: str):
     """
     Требование: новый запрос -> новое сообщение от бота.
-    Поэтому всегда send_photo с caption (НЕ edit).
+    Поэтому всегда reply_photo/reply_text (НЕ edit).
     """
-    price = get_price(symbol)
-    change24 = get_24h_change(symbol)
+    sym = symbol.upper().strip()
+
+    if not binance_pair_exists(sym, "USDT"):
+        await message.reply_text(binance_symbol_hint(sym), reply_markup=kb_main_menu())
+        return
+
+    price = get_price(sym)
+    change24 = get_24h_change(sym)
 
     if tf == "1h":
-        df = get_candles(symbol, "1h", 80)
+        df = get_candles(sym, "1h", 120)
     elif tf == "4h":
-        df = get_candles(symbol, "4h", 80)
+        df = get_candles(sym, "4h", 120)
     else:
-        df = get_candles(symbol, "1d", 80)
+        df = get_candles(sym, "1d", 120)
 
-    # Если Binance не дал данные — даём подсказку
     if price is None or change24 is None or df is None or df.empty:
-        await message.reply_text(
-            binance_symbol_hint(symbol),
-            reply_markup=kb_main_menu()
-        )
+        await message.reply_text(binance_symbol_hint(sym), reply_markup=kb_main_menu())
         return
 
     trend_text, trend_change = detect_trend(df)
-    chart_buf, rsi_value = build_chart_with_rsi(df, symbol, tf)
+    chart_buf, rsi_value = build_chart_with_rsi(df, sym, tf)
 
     caption = (
-        f"💰 {symbol}: ${price:.2f}\n"
+        f"💰 {sym}USDT: {price:.6f}\n"
         f"📉 24h: {change24:.2f}%\n"
         f"📊 Тренд: {trend_text}\n"
-        f"📈 Движение (на выбранном TF): {trend_change:.2f}%\n"
+        f"📈 Движение (на TF): {trend_change:.2f}%\n"
         f"📉 RSI: {rsi_value:.2f} — {rsi_text(rsi_value)}\n"
         f"⏱ Таймфрейм: {tf} (МСК)\n\n"
-        f"🔔 Уведомление: нажми «Установить уведомление»"
+        f"🔔 Уведомления: «Установить уведомление»"
     )
 
-    # 1 СООБЩЕНИЕ: фото + подпись + кнопки
     await message.reply_photo(photo=chart_buf, caption=caption, reply_markup=kb_after_chart())
 
 
 # ===================== ФОНОВАЯ ПРОВЕРКА УВЕДОМЛЕНИЙ =====================
 
 async def alerts_loop(app):
-    """
-    Бесконечный цикл (без JobQueue).
-    Проверяет условия и шлёт уведомления.
-    """
     while True:
         try:
-            # пробегаем по всем
+            # обновим кеш пар иногда (чтобы не устаревал)
+            refresh_binance_symbols()
+
             for user_id, items in list(ALERTS.items()):
                 if not items:
                     continue
 
-                # чтобы не спамить API, можно кешировать цены по символу
                 cache_price: Dict[str, Optional[float]] = {}
 
                 for a in list(items):
                     if not a.is_active:
                         continue
 
+                    # если внезапно пары USDT нет — пропускаем
+                    if not binance_pair_exists(a.symbol, "USDT"):
+                        continue
+
                     if a.symbol not in cache_price:
                         cache_price[a.symbol] = get_price(a.symbol)
-                    cur = cache_price[a.symbol]
 
+                    cur = cache_price[a.symbol]
                     if cur is None:
                         continue
 
@@ -622,20 +713,18 @@ async def alerts_loop(app):
                         arrow = "≥" if a.direction == "above" else "≤"
                         text = (
                             "🔔 Сработало уведомление!\n"
-                            f"#{a.alert_id} {a.symbol}\n"
+                            f"#{a.alert_id} {a.symbol}USDT\n"
                             f"Условие: {arrow} {a.target}\n"
-                            f"Текущая: {cur:.2f}"
+                            f"Текущая: {cur:.6f}"
                         )
                         try:
                             await app.bot.send_message(chat_id=user_id, text=text, reply_markup=kb_after_alert_created())
                         except Exception:
                             pass
 
-                        # удаляем после срабатывания
                         delete_alert(user_id, a.alert_id)
 
         except Exception:
-            # чтобы цикл не падал
             pass
 
         await asyncio.sleep(CHECK_ALERTS_EVERY_SECONDS)
@@ -643,6 +732,7 @@ async def alerts_loop(app):
 
 async def post_init(app):
     load_alerts()
+    refresh_binance_symbols(force=True)
     app.create_task(alerts_loop(app))
 
 
@@ -650,7 +740,6 @@ async def post_init(app):
 
 def main():
     if not TOKEN:
-        # чтобы на Render было видно причину в логах
         raise RuntimeError("❌ Не найден BOT_TOKEN. Добавь переменную окружения BOT_TOKEN в Render.")
 
     application = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
